@@ -8,6 +8,9 @@ use crate::random::random;
 use crate::shim_stack::init_stack_with_guard;
 use crate::snp::cpuid;
 use crate::usermode::usermode;
+use crate::{
+    EXEC_BRK_VIRT_ADDR_BASE, EXEC_ELF_VIRT_ADDR_BASE, EXEC_STACK_SIZE, EXEC_STACK_VIRT_ADDR_BASE,
+};
 
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -17,26 +20,12 @@ use goblin::elf::header::header64::Header;
 use goblin::elf::header::ELFMAG;
 use goblin::elf::program_header::program_header64::*;
 use lset::Line;
-use nbytes::bytes;
 use spin::{Lazy, RwLock};
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 /// Indicator, if the executable is ready to be executed or already executed
 pub static EXEC_READY: AtomicBool = AtomicBool::new(false);
-
-/// Exec virtual address, where the elf binary is mapped to, plus a random offset
-const EXEC_ELF_VIRT_ADDR_BASE: VirtAddr = VirtAddr::new_truncate(0x7f00_0000_0000);
-
-/// The first brk virtual address the exec gets, plus a random offset
-const EXEC_BRK_VIRT_ADDR_BASE: VirtAddr = VirtAddr::new_truncate(0x5555_0000_0000);
-
-/// Exec stack virtual address
-const EXEC_STACK_VIRT_ADDR_BASE: VirtAddr = VirtAddr::new_truncate(0x7ff0_0000_0000);
-
-/// Initial exec stack size
-#[allow(clippy::integer_arithmetic)]
-const EXEC_STACK_SIZE: u64 = bytes![2; MiB];
 
 /// The randomized virtual address of the exec
 #[cfg(not(feature = "gdb"))]
@@ -85,9 +74,10 @@ fn map_elf(app_virt_start: VirtAddr) -> &'static Header {
         .iter()
         .filter(|ph| ph.p_type == PT_LOAD && ph.p_memsz > 0)
     {
-        let map_from = PhysAddr::new(code_start_phys.checked_add(ph.p_paddr).unwrap());
-
-        let map_to = app_virt_start + ph.p_vaddr;
+        let voff = ph.p_paddr % ph.p_align;
+        let map_from = PhysAddr::new(code_start_phys.checked_add(ph.p_paddr - voff).unwrap());
+        let voff = ph.p_vaddr % ph.p_align;
+        let map_to = app_virt_start + ph.p_vaddr - voff;
 
         let mut page_table_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if (ph.p_flags & PF_X) == 0 {
@@ -97,14 +87,14 @@ fn map_elf(app_virt_start: VirtAddr) -> &'static Header {
             page_table_flags |= PageTableFlags::WRITABLE
         };
 
-        debug_assert_eq!(ph.p_align, Page::<Size4KiB>::SIZE);
+        debug_assert_eq!(ph.p_align % Page::<Size4KiB>::SIZE, 0);
 
         ALLOCATOR
             .lock()
             .map_memory(
                 map_from,
                 map_to,
-                ph.p_memsz as _,
+                (ph.p_memsz + voff) as _,
                 page_table_flags,
                 PageTableFlags::PRESENT
                     | PageTableFlags::USER_ACCESSIBLE
